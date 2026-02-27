@@ -18,6 +18,12 @@ import io
 # Import configuration
 import config
 
+# Import blockchain and webhook modules
+from blockchain.rpc_client import RPCClient, NetworkType
+from blockchain.wallet_manager import WalletManager
+import aiohttp
+from aiohttp import web
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA STORAGE (Per-Server)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -60,6 +66,12 @@ def get_guild_data(guild_id: int):
 
 # Load initial data
 bot_data = load_data()
+
+# Initialize blockchain and webhook components
+rpc_client: Optional[RPCClient] = None
+wallet_manager: Optional[WalletManager] = None
+webhook_server: Optional[web.AppRunner] = None
+webhook_app: Optional[web.Application] = None
 
 # Migrate old data format if needed
 if "guilds" not in bot_data:
@@ -1019,11 +1031,131 @@ class ConfirmView(ui.View):
             save_data(bot_data)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WEBHOOK EVENT HANDLER & BACKGROUND TASKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_blockchain_webhook(request: web.Request) -> web.Response:
+    """Handle incoming blockchain webhook events from monitoring services.
+    
+    Expected webhook payload:
+    {
+        "event_id": "unique_event_id",
+        "network": "ETH|BTC|SOL|LTC",
+        "tx_hash": "transaction_hash",
+        "status": "pending|confirmed|failed|cancelled",
+        "confirmations": 0,
+        "trade_id": "associated_trade_id"
+    }
+    """
+    try:
+        data = await request.json()
+        
+        # Validate required fields
+        required_fields = ["event_id", "network", "tx_hash", "status", "trade_id"]
+        if not all(field in data for field in required_fields):
+            return web.json_response(
+                {"error": "Missing required fields"},
+                status=400
+            )
+        
+        # Store webhook event in bot_data for processing
+        if "webhook_events" not in bot_data["global"]:
+            bot_data["global"]["webhook_events"] = {}
+        
+        event_id = data["event_id"]
+        bot_data["global"]["webhook_events"][event_id] = {
+            "event_id": event_id,
+            "network": data["network"],
+            "tx_hash": data["tx_hash"],
+            "status": data["status"],
+            "confirmations": data.get("confirmations", 0),
+            "trade_id": data["trade_id"],
+            "received_at": datetime.utcnow().isoformat(),
+            "processed": False
+        }
+        save_data(bot_data)
+        
+        return web.json_response(
+            {"success": True, "event_id": event_id},
+            status=200
+        )
+    
+    except Exception as e:
+        print(f"❌ Webhook error: {e}")
+        return web.json_response(
+            {"error": str(e)},
+            status=500
+        )
+
+
+async def process_webhook_events():
+    """Background task to process webhook events and update trade states.
+    
+    Runs continuously, checking for unprocessed webhook events and updating
+    the corresponding trade data in bot_data.json.
+    """
+    await bot.wait_until_ready()
+    
+    while not bot.is_closed():
+        try:
+            if "webhook_events" not in bot_data["global"]:
+                bot_data["global"]["webhook_events"] = {}
+            
+            # Process unprocessed events
+            for event_id, event_data in list(bot_data["global"]["webhook_events"].items()):
+                if not event_data.get("processed"):
+                    trade_id = event_data.get("trade_id")
+                    status = event_data.get("status")
+                    
+                    # Update trade state based on webhook event
+                    if "trades" not in bot_data["global"]:
+                        bot_data["global"]["trades"] = {}
+                    
+                    if trade_id not in bot_data["global"]["trades"]:
+                        bot_data["global"]["trades"][trade_id] = {
+                            "id": trade_id,
+                            "status": "pending",
+                            "events": []
+                        }
+                    
+                    # Update trade status based on webhook event
+                    if status == "confirmed":
+                        bot_data["global"]["trades"][trade_id]["status"] = "confirmed"
+                    elif status == "failed":
+                        bot_data["global"]["trades"][trade_id]["status"] = "failed"
+                    elif status == "cancelled":
+                        bot_data["global"]["trades"][trade_id]["status"] = "cancelled"
+                    
+                    # Add event to trade history
+                    bot_data["global"]["trades"][trade_id]["events"].append({
+                        "event_id": event_id,
+                        "network": event_data.get("network"),
+                        "tx_hash": event_data.get("tx_hash"),
+                        "status": status,
+                        "confirmations": event_data.get("confirmations", 0),
+                        "timestamp": event_data.get("received_at")
+                    })
+                    
+                    # Mark event as processed
+                    event_data["processed"] = True
+                    save_data(bot_data)
+            
+            # Sleep before next check
+            await asyncio.sleep(5)
+        
+        except Exception as e:
+            print(f"❌ Error processing webhook events: {e}")
+            await asyncio.sleep(10)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # EVENTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot.event
 async def on_ready():
+    global rpc_client, wallet_manager, webhook_server, webhook_app
+    
     print(f"{'='*50}")
     print(f"  MM Bot Online!")
     print(f"  Logged in as: {bot.user.name}")
@@ -1032,6 +1164,48 @@ async def on_ready():
     print(f"  Servers: {len(bot.guilds)}")
     print(f"  Per-server config: ENABLED")
     print(f"{'='*50}")
+    
+    # Initialize RPC client for blockchain connectivity
+    try:
+        rpc_client = RPCClient(
+            eth_rpc_url=os.getenv("ETH_RPC_URL"),
+            btc_rpc_url=os.getenv("BTC_RPC_URL"),
+            sol_rpc_url=os.getenv("SOL_RPC_URL"),
+            ltc_rpc_url=os.getenv("LTC_RPC_URL"),
+            timeout=10.0,
+            max_retries=3
+        )
+        await rpc_client.connect()
+        print("✓ RPC client initialized")
+    except Exception as e:
+        print(f"✗ Failed to initialize RPC client: {e}")
+    
+    # Initialize wallet manager for trade wallet generation
+    try:
+        wallet_manager = WalletManager(
+            data_file=DATA_FILE,
+            encryption_key=os.getenv("WALLET_ENCRYPTION_KEY")
+        )
+        print("✓ Wallet manager initialized")
+    except Exception as e:
+        print(f"✗ Failed to initialize wallet manager: {e}")
+    
+    # Initialize webhook server for blockchain event processing
+    try:
+        webhook_app = web.Application()
+        webhook_app.router.add_post('/webhook/blockchain', handle_blockchain_webhook)
+        webhook_server = web.AppRunner(webhook_app)
+        await webhook_server.setup()
+        webhook_port = int(os.getenv("WEBHOOK_PORT", "8080"))
+        site = web.TCPSite(webhook_server, "0.0.0.0", webhook_port)
+        await site.start()
+        print(f"✓ Webhook server started on port {webhook_port}")
+    except Exception as e:
+        print(f"✗ Failed to start webhook server: {e}")
+    
+    # Start background event processor task
+    if not bot.loop.is_running():
+        bot.loop.create_task(process_webhook_events())
     
     bot.add_view(MMPanelView())
     bot.add_view(TicketControlView())
@@ -1043,6 +1217,26 @@ async def on_ready():
     bot.add_view(SupportPanelView())
     
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=config.BOT_STATUS))
+
+@bot.event
+async def on_shutdown():
+    """Cleanup when bot shuts down."""
+    global rpc_client, webhook_server
+    
+    try:
+        if rpc_client:
+            await rpc_client.close()
+            print("✓ RPC client closed")
+    except Exception as e:
+        print(f"✗ Error closing RPC client: {e}")
+    
+    try:
+        if webhook_server:
+            await webhook_server.cleanup()
+            print("✓ Webhook server closed")
+    except Exception as e:
+        print(f"✗ Error closing webhook server: {e}")
+
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -1671,6 +1865,226 @@ async def ping(ctx):
     latency = round(bot.latency * 1000)
     color = config.COLORS["SUCCESS"] if latency < 100 else config.COLORS["WARNING"] if latency < 200 else config.COLORS["ERROR"]
     await ctx.send(embed=discord.Embed(title="Pong!", description=f"**Latency:** {latency}ms", color=color))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLOCKCHAIN COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@bot.command(name="wallet")
+@is_helper()
+async def wallet_command(ctx, network: str = None):
+    """Generate encrypted wallets for trades across multiple blockchain networks.
+    
+    Usage:
+        +wallet                 # Generate wallets for all networks (ETH, BTC, SOL, LTC)
+        +wallet ETH             # Generate wallet for specific network
+    
+    Wallets are encrypted and stored in bot_data.json with trade association.
+    """
+    if not wallet_manager:
+        await ctx.send(embed=create_embed("❌ Wallet Manager Unavailable", "Wallet manager not initialized.", config.COLORS["ERROR"]))
+        return
+    
+    # Generate trade ID from channel and timestamp
+    trade_id = f"trade_{ctx.channel.id}_{int(datetime.utcnow().timestamp())}"
+    
+    try:
+        networks_to_generate = []
+        if network:
+            network = network.upper()
+            if network not in wallet_manager.NETWORKS:
+                await ctx.send(embed=create_embed("❌ Invalid Network", f"Supported networks: ETH, BTC, SOL, LTC", config.COLORS["ERROR"]))
+                return
+            networks_to_generate = [network]
+        else:
+            networks_to_generate = list(wallet_manager.NETWORKS.keys())
+        
+        # Generate wallets
+        created_wallets = {}
+        for net in networks_to_generate:
+            try:
+                wallet = wallet_manager.create_wallet(net, trade_id)
+                created_wallets[net] = {
+                    "address": wallet.get("address"),
+                    "created_at": wallet.get("created_at")
+                }
+            except Exception as e:
+                print(f"❌ Failed to create {net} wallet: {e}")
+        
+        if not created_wallets:
+            await ctx.send(embed=create_embed("❌ Wallet Generation Failed", "No wallets were created.", config.COLORS["ERROR"]))
+            return
+        
+        # Create response embed
+        embed = discord.Embed(
+            title="💰 Wallets Generated",
+            description=f"Trade ID: `{trade_id}`\n\nNew wallets created for escrow:",
+            color=config.COLORS["SUCCESS"]
+        )
+        
+        for net, wallet_info in created_wallets.items():
+            network_name = wallet_manager.NETWORKS[net]["name"]
+            embed.add_field(
+                name=f"{network_name} ({net})",
+                value=f"```{wallet_info['address']}```",
+                inline=False
+            )
+        
+        embed.set_footer(text="⚠️ Private keys are encrypted and stored securely.")
+        await ctx.send(embed=embed)
+        
+        # Log to channel
+        log_channel = get_channel_from_config(ctx.guild, "LOG_CHANNEL")
+        if log_channel:
+            log_embed = discord.Embed(
+                title="📝 Wallet Generation Log",
+                description=f"Trade ID: `{trade_id}`\nGenerated by: {ctx.author.mention}",
+                color=config.COLORS["INFO"]
+            )
+            for net, wallet_info in created_wallets.items():
+                network_name = wallet_manager.NETWORKS[net]["name"]
+                log_embed.add_field(name=network_name, value=f"`{wallet_info['address']}`", inline=False)
+            log_embed.timestamp = datetime.utcnow()
+            try:
+                await log_channel.send(embed=log_embed)
+            except:
+                pass
+    
+    except Exception as e:
+        await ctx.send(embed=create_embed("❌ Error", f"Failed to generate wallets: {str(e)}", config.COLORS["ERROR"]))
+
+
+@bot.command(name="rpc-health")
+@is_helper()
+async def rpc_health_command(ctx):
+    """Check RPC endpoint health status for all configured blockchain networks.
+    
+    Returns status for: Ethereum, Bitcoin, Solana, Litecoin
+    """
+    if not rpc_client:
+        await ctx.send(embed=create_embed("❌ RPC Client Unavailable", "RPC client not initialized.", config.COLORS["ERROR"]))
+        return
+    
+    try:
+        # Check health of all networks
+        health_results = await rpc_client.health_check_all()
+        
+        if not health_results:
+            await ctx.send(embed=create_embed("⚠️ No Networks Configured", "No RPC endpoints are configured.", config.COLORS["WARNING"]))
+            return
+        
+        # Create status embed
+        embed = discord.Embed(
+            title="🏥 RPC Health Status",
+            description="Blockchain network endpoint health check",
+            color=config.COLORS["INFO"]
+        )
+        
+        all_healthy = True
+        for network, is_healthy in health_results.items():
+            status_icon = "✅" if is_healthy else "❌"
+            status_text = "Healthy" if is_healthy else "Unhealthy"
+            embed.add_field(
+                name=f"{status_icon} {network.upper()}",
+                value=status_text,
+                inline=True
+            )
+            if not is_healthy:
+                all_healthy = False
+        
+        # Set color based on overall health
+        if all_healthy:
+            embed.color = config.COLORS["SUCCESS"]
+        else:
+            embed.color = config.COLORS["WARNING"]
+        
+        embed.timestamp = datetime.utcnow()
+        embed.set_footer(text="Health check timeout: 2 seconds per network")
+        
+        await ctx.send(embed=embed)
+    
+    except Exception as e:
+        await ctx.send(embed=create_embed("❌ Health Check Error", f"Failed to check RPC health: {str(e)}", config.COLORS["ERROR"]))
+
+
+@bot.command(name="metrics")
+@is_helper()
+async def metrics_command(ctx):
+    """Display blockchain and webhook monitoring dashboard.
+    
+    Shows:
+    - RPC endpoint health status
+    - Webhook event statistics
+    - Trade processing metrics
+    - Network performance data
+    """
+    try:
+        embed = discord.Embed(
+            title="📊 Monitoring Dashboard",
+            description="Blockchain & Webhook Metrics",
+            color=config.COLORS["PRIMARY"]
+        )
+        
+        # RPC Health Section
+        if rpc_client:
+            health_results = await rpc_client.health_check_all()
+            health_text = ""
+            for network, is_healthy in health_results.items():
+                status = "✅ Online" if is_healthy else "❌ Offline"
+                health_text += f"{network.upper()}: {status}\n"
+            
+            if health_text:
+                embed.add_field(name="🔗 RPC Endpoints", value=health_text, inline=False)
+        
+        # Webhook Events Section
+        webhook_events = bot_data["global"].get("webhook_events", {})
+        total_events = len(webhook_events)
+        processed_events = sum(1 for e in webhook_events.values() if e.get("processed"))
+        pending_events = total_events - processed_events
+        
+        webhook_text = f"Total Events: {total_events}\n"
+        webhook_text += f"Processed: {processed_events}\n"
+        webhook_text += f"Pending: {pending_events}"
+        embed.add_field(name="🔔 Webhook Events", value=webhook_text, inline=True)
+        
+        # Trade Statistics Section
+        trades = bot_data["global"].get("trades", {})
+        total_trades = len(trades)
+        confirmed_trades = sum(1 for t in trades.values() if t.get("status") == "confirmed")
+        failed_trades = sum(1 for t in trades.values() if t.get("status") == "failed")
+        pending_trades = sum(1 for t in trades.values() if t.get("status") == "pending")
+        
+        trade_text = f"Total Trades: {total_trades}\n"
+        trade_text += f"✅ Confirmed: {confirmed_trades}\n"
+        trade_text += f"⏳ Pending: {pending_trades}\n"
+        trade_text += f"❌ Failed: {failed_trades}"
+        embed.add_field(name="💱 Trade Status", value=trade_text, inline=True)
+        
+        # Wallet Statistics Section
+        if wallet_manager:
+            wallet_data = wallet_manager._load_data()
+            total_wallets = len(wallet_data.get("wallets", {}))
+            
+            # Count wallets by network
+            network_counts = {}
+            for wallet in wallet_data.get("wallets", {}).values():
+                network = wallet.get("network", "unknown")
+                network_counts[network] = network_counts.get(network, 0) + 1
+            
+            wallet_text = f"Total Wallets: {total_wallets}\n"
+            for network, count in sorted(network_counts.items()):
+                wallet_text += f"{network}: {count}\n"
+            
+            embed.add_field(name="💰 Wallets", value=wallet_text, inline=True)
+        
+        embed.timestamp = datetime.utcnow()
+        embed.set_footer(text="Dashboard updated in real-time")
+        
+        await ctx.send(embed=embed)
+    
+    except Exception as e:
+        await ctx.send(embed=create_embed("❌ Dashboard Error", f"Failed to load metrics: {str(e)}", config.COLORS["ERROR"]))
+
 
 @bot.command(name="help")
 async def help_command(ctx, category: str = None):
