@@ -537,3 +537,95 @@ TICKET_QUESTIONS = [
         "max_length": 50
     },
 ]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLOCKCHAIN CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BLOCKCHAIN_NETWORKS = [
+    {
+        "name": "Ethereum",
+        "symbol": "ETH",
+        "chain_id": 1,
+        "rpc_endpoint": "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+        "enabled": True,
+        "confirmations_required": 12,
+    },
+    {
+        "name": "Bitcoin",
+        "symbol": "BTC",
+        "chain_id": None,
+        "rpc_endpoint": "https://api.blockcypher.com/v1/btc/main",
+        "enabled": True,
+        "confirmations_required": 3,
+    },
+    {
+        "name": "Solana",
+        "symbol": "SOL",
+        "chain_id": None,
+        "rpc_endpoint": "https://api.mainnet-beta.solana.com",
+        "enabled": True,
+        "confirmations_required": 32,
+    },
+    {
+        "name": "Litecoin",
+        "symbol": "LTC",
+        "chain_id": None,
+        "rpc_endpoint": "https://api.blockcypher.com/v1/ltc/main",
+        "enabled": True,
+        "confirmations_required": 6,
+    },
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WALLET CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WALLET_ENCRYPTION_ENABLED = True
+
+WALLET_CONFIG = {
+    "encryption_algorithm": "Fernet",  # Fernet symmetric encryption
+    "key_derivation": "PBKDF2",
+    "key_rotation_days": 90,
+    "backup_enabled": True,
+    "backup_location": "./backups/wallets/",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEBHOOK CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WEBHOOK_CONFIRMATION_THRESHOLD = 3  # Minimum confirmations before webhook fires
+
+WEBHOOK_RETRY_CONFIG = {
+    "max_attempts": 5,
+    "backoff_factor": 2,  # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+    "initial_delay_seconds": 1,
+    "max_delay_seconds": 300,
+}
+
+WEBHOOK_CONFIG = {
+    "timeout_seconds": 30,
+    "verify_ssl": True,
+    "rate_limit_per_minute": 100,
+    "batch_processing": True,
+    "batch_size": 10,
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MONITORING CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MONITORING_ENABLED = True
+
+MONITORING_CONFIG = {
+    "log_level": "INFO",  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    "log_file": "./logs/blockchain_monitor.log",
+    "max_log_size_mb": 100,
+    "log_retention_days": 30,
+    "metrics_enabled": True,
+    "metrics_interval_seconds": 60,
+    "health_check_interval_seconds": 300,
+    "alert_on_error": True,
+    "alert_discord_webhook": None,  # Set to Discord webhook URL for alerts
+}
